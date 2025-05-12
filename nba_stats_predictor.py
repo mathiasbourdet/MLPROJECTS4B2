@@ -4,7 +4,7 @@ from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import TimeSeriesSplit
 import joblib
 import os
 import warnings
@@ -51,24 +51,39 @@ class NBAStatsPredictor:
             key_columns = ['player_id', 'Date', 'PTS', 'MP']
             self.data = self.data.dropna(subset=key_columns)
             
-            # Trier par joueur et date
+            # Trier par joueur et date - ESSENTIEL pour éviter la fuite de données
             self.data = self.data.sort_values(['player_id', 'Date'])
             
-            # Créer des caractéristiques de tendance (moyennes mobiles et plus)
-            self._create_enhanced_features()
+            # Ajouter indicateur domicile/extérieur
+            self.data['is_home'] = ~self.data['Opp'].str.contains('@', na=False).astype(int)
             
-            # Calculer les forces des équipes
-            self._calculate_team_strength()
+            # Ajouter jours de repos - ATTENTION: ne pas utiliser diff() directement car peut causer des fuites
+            self.data['rest_days'] = self.data.groupby('player_id')['Date'].diff().dt.days.fillna(3)
+            
+            # Ajouter indicateur de back-to-back (match dos à dos)
+            self.data['is_back_to_back'] = (self.data['rest_days'] <= 1).astype(int)
+            
+            # Calculer l'utilisation du joueur (% des possessions terminées par le joueur)
+            # Formule simplifiée: (FGA + 0.44*FTA + TOV) / MP
+            self.data['usage_rate'] = (self.data['FGA'] + 0.44*self.data['FTA'] + self.data['TOV']) / self.data['MP']
+            
+            # Efficacité offensive (points par tir)
+            self.data['pts_per_shot'] = self.data['PTS'] / (self.data['FGA'] + 0.44*self.data['FTA'])
             
             print(f"Préparation des données terminée. {len(self.data)} matchs après nettoyage.")
             
         except Exception as e:
             print(f"Erreur lors du chargement des données: {e}")
     
-    def _calculate_team_strength(self):
-        """Calcule des métriques de force pour chaque équipe"""
+    def _calculate_team_strength(self, train_data_only):
+        """
+        Calcule des métriques de force pour chaque équipe, UNIQUEMENT avec les données d'entraînement
+        
+        Args:
+            train_data_only (pd.DataFrame): Données d'entraînement uniquement
+        """
         # Calcul de la cote défensive de chaque équipe (points encaissés/100 possessions)
-        team_games = self.data.groupby(['Date', 'Opp']).agg({'PTS': 'sum'}).reset_index()
+        team_games = train_data_only.groupby(['Date', 'Opp']).agg({'PTS': 'sum'}).reset_index()
         team_games.columns = ['Date', 'Team', 'PTS_Against']
         
         # Moyenne des points encaissés par match pour chaque équipe
@@ -80,73 +95,53 @@ class NBAStatsPredictor:
             self.team_defensive_ratings[team] = 100 * (avg_pts / team_def.loc[team, 'PTS_Against'])
 
         # Calcul du rythme de jeu de chaque équipe (estimé par les possessions)
-        team_pace = self.data.groupby('Team').agg({'FGA': 'mean', 'TOV': 'mean'})
+        team_pace = train_data_only.groupby('Team').agg({'FGA': 'mean', 'TOV': 'mean'})
         avg_pace = team_pace.mean().sum()
         
         for team in team_pace.index:
             pace_value = (team_pace.loc[team, 'FGA'] + team_pace.loc[team, 'TOV']) / avg_pace
             self.team_pace_factors[team] = pace_value
             
-    def _create_enhanced_features(self):
-        """Créer des caractéristiques avancées pour mieux capturer les variations match par match"""
-        # Grouper par joueur
-        grouped = self.data.groupby('player_id')
+    def _create_features_for_player(self, player_data, for_prediction=False):
+        """
+        Crée des caractéristiques avancées pour un joueur donné, en respectant la temporalité
         
-        # Moyennes mobiles et écarts-types sur différentes fenêtres
+        Args:
+            player_data (pd.DataFrame): Données d'un joueur spécifique, triées par date
+            for_prediction (bool): Si True, crée les caractéristiques pour la prédiction
+                                   (en utilisant toutes les données)
+            
+        Returns:
+            pd.DataFrame: Données avec caractéristiques ajoutées
+        """
+        result = player_data.copy()
+        
+        # Pour chaque statistique à prédire
         for stat in self.stats_to_predict:
             # Moyennes mobiles standard (3, 5, 10 matchs)
-            self.data[f'{stat}_avg_3'] = grouped[stat].transform(
-                lambda x: x.shift(1).rolling(window=3, min_periods=1).mean())
-            
-            self.data[f'{stat}_avg_5'] = grouped[stat].transform(
-                lambda x: x.shift(1).rolling(window=5, min_periods=1).mean())
-            
-            self.data[f'{stat}_avg_10'] = grouped[stat].transform(
-                lambda x: x.shift(1).rolling(window=10, min_periods=1).mean())
+            # IMPORTANT: Utiliser shift(1) pour éviter la fuite de données
+            result[f'{stat}_avg_3'] = result[stat].shift(1).rolling(window=3, min_periods=1).mean()
+            result[f'{stat}_avg_5'] = result[stat].shift(1).rolling(window=5, min_periods=1).mean()
+            result[f'{stat}_avg_10'] = result[stat].shift(1).rolling(window=10, min_periods=1).mean()
             
             # Écart-type sur les derniers matchs (mesure de consistance)
-            self.data[f'{stat}_std_5'] = grouped[stat].transform(
-                lambda x: x.shift(1).rolling(window=5, min_periods=2).std())
+            result[f'{stat}_std_5'] = result[stat].shift(1).rolling(window=5, min_periods=2).std()
             
             # Tendance linéaire (pente sur les 5 derniers matchs)
-            self.data[f'{stat}_trend'] = grouped[stat].transform(
-                lambda x: (x.shift(1) - x.shift(5)) / 4 if len(x) >= 5 else 0)
+            result[f'{stat}_trend'] = (result[stat].shift(1) - result[stat].shift(5)) / 4
             
             # Performances pondérées par récence (plus de poids aux matchs récents)
-            weights = np.array([0.5, 0.3, 0.2])  # Plus récent → plus important
-            self.data[f'{stat}_weighted'] = grouped.apply(
-                lambda g: g[stat].shift(1).rolling(window=3, min_periods=1).apply(
-                    lambda x: np.sum(weights[:len(x)] * x[::-1]) / np.sum(weights[:len(x)]) 
-                    if len(x) > 0 else np.nan)
-            ).reset_index(level=0, drop=True)
-            
-            # Performance contre l'équipe spécifique (historique vs cette équipe)
-            # Cette fonction sera complexe car nécessite de croiser les données par adversaire
-            # Simplifié ici
-            
-        # Ajouter d'autres caractéristiques contextuelles
-        # Jours de repos
-        self.data['rest_days'] = grouped['Date'].transform(
-            lambda x: (x - x.shift(1)).dt.days)
+            def weighted_avg(x):
+                if len(x) == 0:
+                    return np.nan
+                weights = np.array([0.5, 0.3, 0.2])[:len(x)]
+                weights = weights / weights.sum()
+                return np.sum(weights * x[::-1])
+                
+            result[f'{stat}_weighted'] = result[stat].shift(1).rolling(window=3, min_periods=1).apply(
+                weighted_avg, raw=True)
         
-        # Indicateur domicile/extérieur
-        self.data['is_home'] = ~self.data['Opp'].str.contains('@', na=False).astype(int)
-        
-        # Ajouter indicateur de back-to-back (match dos à dos)
-        self.data['is_back_to_back'] = (self.data['rest_days'] <= 1).astype(int)
-        
-        # Ajouter indicateur de road trip (série de matchs à l'extérieur)
-        # Détecte 3+ matchs consécutifs à l'extérieur
-        self.data['road_trip_game'] = 0
-        
-        # Calculer l'utilisation du joueur (% des possessions terminées par le joueur)
-        # Formule simplifiée: (FGA + 0.44*FTA + TOV) / MP
-        self.data['usage_rate'] = (self.data['FGA'] + 0.44*self.data['FTA'] + self.data['TOV']) / self.data['MP']
-        
-        # Efficacité offensive (points par tir)
-        self.data['pts_per_shot'] = self.data['PTS'] / (self.data['FGA'] + 0.44*self.data['FTA'])
-        
-        print("Caractéristiques avancées créées avec succès")
+        return result
             
     def train_models(self, retrain=False):
         """
@@ -179,89 +174,135 @@ class NBAStatsPredictor:
                 # Définir les caractéristiques personnalisées pour cette statistique
                 if stat in ['PTS', 'FG%', '3P']:
                     # Stats offensives - utiliser caractéristiques spécifiques à l'attaque
-                    features = [
-                        f'{stat}_avg_3', f'{stat}_avg_5', f'{stat}_avg_10', 
-                        f'{stat}_std_5', f'{stat}_trend', f'{stat}_weighted',
+                    base_features = [
                         'usage_rate', 'pts_per_shot', 'rest_days', 
-                        'is_home', 'is_back_to_back', 'road_trip_game',
-                        'Team', 'Opp'
+                        'is_home', 'is_back_to_back', 'Team', 'Opp'
                     ]
                 elif stat in ['TRB', 'BLK']:
                     # Stats défensives
-                    features = [
-                        f'{stat}_avg_3', f'{stat}_avg_5', f'{stat}_avg_10', 
-                        f'{stat}_std_5', f'{stat}_trend', f'{stat}_weighted',
+                    base_features = [
                         'rest_days', 'is_home', 'is_back_to_back',
                         'Team', 'Opp'
                     ]
                 else:
                     # Stats mixtes
-                    features = [
-                        f'{stat}_avg_3', f'{stat}_avg_5', f'{stat}_avg_10', 
-                        f'{stat}_std_5', f'{stat}_trend', f'{stat}_weighted',
+                    base_features = [
                         'usage_rate', 'rest_days', 'is_home', 
                         'is_back_to_back', 'Team', 'Opp'
                     ]
                 
-                # Éliminer les lignes avec des NaN dans les caractéristiques
-                valid_data = player_data.dropna(subset=features + [stat])
+                # Utiliser TimeSeriesSplit pour respecter la temporalité des données
+                tscv = TimeSeriesSplit(n_splits=5, test_size=3)
                 
-                if len(valid_data) < 15:
-                    print(f"  Pas assez de données pour {stat}, ignoré")
-                    continue
+                best_model = None
+                best_score = -np.inf
                 
-                # Diviser en ensemble d'entraînement et de validation
-                X = valid_data[features]
-                y = valid_data[stat]
-                
-                if len(valid_data) > 30:  # Assez de données pour faire un split
-                    X_train, X_val, y_train, y_val = train_test_split(
-                        X, y, test_size=0.2, random_state=42)
-                else:
-                    X_train, y_train = X, y
-                
-                # Définir les préprocesseurs pour les colonnes catégorielles
-                categorical_features = ['Team', 'Opp']
-                categorical_transformer = OneHotEncoder(handle_unknown='ignore')
-                
-                # Préprocesseur pour les colonnes numériques
-                numerical_features = [f for f in features if f not in categorical_features]
-                numerical_transformer = StandardScaler()
-                
-                preprocessor = ColumnTransformer(
-                    transformers=[
-                        ('cat', categorical_transformer, categorical_features),
-                        ('num', numerical_transformer, numerical_features)
-                    ]
-                )
-                
-                # Utiliser GradientBoostingRegressor pour plus de précision
-                pipeline = Pipeline(steps=[
-                    ('preprocessor', preprocessor),
-                    ('regressor', GradientBoostingRegressor(
-                        n_estimators=150, 
-                        learning_rate=0.05,
-                        max_depth=4,
-                        random_state=42
-                    ))
-                ])
-                
-                # Entraîner le modèle
-                try:
-                    pipeline.fit(X_train, y_train)
+                # IMPORTANT: Pour éviter les fuites de données, on traite chaque fold séparément
+                # TimeSeriesSplit garantit que les données d'entrainement précèdent les données de test
+                for train_index, test_index in tscv.split(player_data):
+                    # Séparer en ensembles d'entraînement et de test
+                    train_data = player_data.iloc[train_index].copy()
+                    test_data = player_data.iloc[test_index].copy()
                     
-                    # Évaluer sur l'ensemble de validation si disponible
-                    if len(valid_data) > 30:
+                    if len(train_data) < 10:  # Pas assez de données pour entraîner
+                        continue
+                        
+                    # CORRECTION: Créer les caractéristiques séparément pour les données d'entraînement
+                    # et les données de test pour éviter la fuite
+                    train_data_with_features = self._create_features_for_player(train_data)
+                    
+                    # Calculer les forces des équipes UNIQUEMENT avec les données d'entraînement
+                    self._calculate_team_strength(train_data_with_features)
+                    
+                    # CORRECTION: Pour les données de test, créons les caractéristiques avec 
+                    # seulement les données jusqu'à la date du premier point de test
+                    test_start_date = test_data['Date'].min()
+                    
+                    # Filtrer les données jusqu'à la date du premier point de test
+                    historical_data_for_test = player_data[player_data['Date'] < test_start_date].copy()
+                    
+                    # Ajouter les données de test à la fin
+                    combined_data = pd.concat([historical_data_for_test, test_data]).sort_values('Date')
+                    
+                    # Créer les caractéristiques pour les données combinées
+                    combined_data_with_features = self._create_features_for_player(combined_data)
+                    
+                    # Extraire uniquement les lignes de test
+                    test_data_with_features = combined_data_with_features[
+                        combined_data_with_features['Date'] >= test_start_date
+                    ].copy()
+                    
+                    # Définir les caractéristiques avancées pour cette statistique
+                    full_features = base_features.copy()
+                    for f in [f'{stat}_avg_3', f'{stat}_avg_5', f'{stat}_avg_10', 
+                              f'{stat}_std_5', f'{stat}_trend', f'{stat}_weighted']:
+                        if f in train_data_with_features.columns:
+                            full_features.append(f)
+                    
+                    # Éliminer les lignes avec des NaN dans les caractéristiques
+                    valid_train = train_data_with_features.dropna(subset=full_features + [stat])
+                    valid_test = test_data_with_features.dropna(subset=full_features + [stat])
+                    
+                    if len(valid_train) < 10:  # Pas assez de données pour entraîner
+                        continue
+                    
+                    # Diviser en X et y
+                    X_train = valid_train[full_features]
+                    y_train = valid_train[stat]
+                    X_test = valid_test[full_features]
+                    y_test = valid_test[stat]
+                    
+                    # Définir les préprocesseurs pour les colonnes catégorielles
+                    categorical_features = [f for f in full_features if f in ['Team', 'Opp']]
+                    categorical_transformer = OneHotEncoder(handle_unknown='ignore')
+                    
+                    # Préprocesseur pour les colonnes numériques
+                    numerical_features = [f for f in full_features if f not in categorical_features]
+                    numerical_transformer = StandardScaler()
+                    
+                    preprocessor = ColumnTransformer(
+                        transformers=[
+                            ('cat', categorical_transformer, categorical_features),
+                            ('num', numerical_transformer, numerical_features)
+                        ],
+                        remainder='passthrough'
+                    )
+                    
+                    # Utiliser GradientBoostingRegressor pour plus de précision
+                    pipeline = Pipeline(steps=[
+                        ('preprocessor', preprocessor),
+                        ('regressor', GradientBoostingRegressor(
+                            n_estimators=150, 
+                            learning_rate=0.05,
+                            max_depth=4,
+                            random_state=42
+                        ))
+                    ])
+                    
+                    # Entraîner le modèle
+                    try:
+                        pipeline.fit(X_train, y_train)
+                        
+                        # Évaluer sur l'ensemble de test
+                        test_score = pipeline.score(X_test, y_test)
                         train_score = pipeline.score(X_train, y_train)
-                        val_score = pipeline.score(X_val, y_val)
-                        print(f"  Modèle pour {stat}: R² train={train_score:.3f}, val={val_score:.3f}")
-                    
-                    # Sauvegarder le modèle
-                    joblib.dump(pipeline, model_filename)
-                    print(f"  Modèle pour {stat} entraîné et sauvegardé")
-                    
-                except Exception as e:
-                    print(f"  Erreur lors de l'entraînement pour {stat}: {e}")
+                        
+                        print(f"  Fold pour {stat}: R² train={train_score:.3f}, test={test_score:.3f}")
+                        
+                        # Garder le meilleur modèle
+                        if test_score > best_score:
+                            best_score = test_score
+                            best_model = pipeline
+                        
+                    except Exception as e:
+                        print(f"  Erreur lors de l'entraînement pour {stat}: {e}")
+                
+                # Sauvegarder le meilleur modèle
+                if best_model is not None:
+                    joblib.dump(best_model, model_filename)
+                    print(f"  Meilleur modèle pour {stat} entraîné et sauvegardé (R²={best_score:.3f})")
+                else:
+                    print(f"  Pas de modèle valide pour {stat}, ignoré")
         
         print("\nEntraînement des modèles terminé!")
                 
@@ -297,6 +338,9 @@ class NBAStatsPredictor:
         def_rating = self.team_defensive_ratings.get(opponent, 100)
         pace_factor = self.team_pace_factors.get(opponent, 1.0)
         
+        # Créer des caractéristiques à jour pour ce joueur
+        player_data_with_features = self._create_features_for_player(player_data, for_prediction=True)
+        
         # Préparer les prédictions
         predictions = {}
         raw_predictions = {}
@@ -323,46 +367,33 @@ class NBAStatsPredictor:
             # Préparer les caractéristiques avancées
             X_pred = {}
             
+            # Utiliser les caractéristiques déjà calculées
+            last_row = player_data_with_features.iloc[-1]
+            
             # Moyennes mobiles
-            X_pred[f'{stat}_avg_3'] = player_data[stat].tail(3).mean()
-            X_pred[f'{stat}_avg_5'] = player_data[stat].tail(5).mean()
-            X_pred[f'{stat}_avg_10'] = player_data[stat].tail(10).mean()
+            X_pred[f'{stat}_avg_3'] = last_row[f'{stat}_avg_3']
+            X_pred[f'{stat}_avg_5'] = last_row[f'{stat}_avg_5']
+            X_pred[f'{stat}_avg_10'] = last_row[f'{stat}_avg_10']
             
             # Écart-type (mesure de consistance)
-            X_pred[f'{stat}_std_5'] = player_data[stat].tail(5).std() if len(player_data) >= 5 else 0
+            X_pred[f'{stat}_std_5'] = last_row[f'{stat}_std_5']
             
             # Tendance (pente sur les 5 derniers matchs)
-            if len(player_data) >= 5:
-                last_5 = player_data[stat].tail(5).values
-                X_pred[f'{stat}_trend'] = (last_5[-1] - last_5[0]) / 4
-            else:
-                X_pred[f'{stat}_trend'] = 0
+            X_pred[f'{stat}_trend'] = last_row[f'{stat}_trend']
             
             # Moyenne pondérée par récence
-            if len(player_data) >= 3:
-                last_3 = player_data[stat].tail(3).values
-                weights = np.array([0.5, 0.3, 0.2])[:len(last_3)]
-                weights = weights / weights.sum()
-                X_pred[f'{stat}_weighted'] = np.sum(last_3[::-1] * weights)
-            else:
-                X_pred[f'{stat}_weighted'] = player_data[stat].mean()
+            X_pred[f'{stat}_weighted'] = last_row[f'{stat}_weighted']
             
             # Caractéristiques d'utilisation du joueur
-            if 'usage_rate' in player_data.columns:
-                X_pred['usage_rate'] = player_data['usage_rate'].tail(5).mean()
-            else:
-                X_pred['usage_rate'] = 0.2  # Valeur par défaut
-                
-            if 'pts_per_shot' in player_data.columns:
-                X_pred['pts_per_shot'] = player_data['pts_per_shot'].tail(5).mean()
-            else:
-                X_pred['pts_per_shot'] = 1.0  # Valeur par défaut
+            X_pred['usage_rate'] = last_row['usage_rate']
+            
+            if 'pts_per_shot' in player_data_with_features.columns:
+                X_pred['pts_per_shot'] = last_row['pts_per_shot']
             
             # Variables contextuelles du match
             X_pred['rest_days'] = rest_days
             X_pred['is_home'] = 1 if is_home else 0
             X_pred['is_back_to_back'] = 1 if back_to_back else 0
-            X_pred['road_trip_game'] = 0  # Simplifié
             X_pred['Team'] = team
             X_pred['Opp'] = opp_format
             
@@ -516,7 +547,8 @@ class NBAStatsPredictor:
         
     def predict_for_all_players(self, opponent, team, is_home=True, rest_days=2, back_to_back=False):
         """
-        Prédit les statistiques pour tous les joueurs d'une équipe contre un adversaire donné
+        Prédit les statistiques pour tous les joueurs d'une équipe contre un adversaire donné,
+        en tenant compte des transferts et de l'équipe actuelle des joueurs
         
         Args:
             opponent (str): Équipe adverse
@@ -524,14 +556,35 @@ class NBAStatsPredictor:
             is_home (bool): Si True, match à domicile
             rest_days (int): Nombre de jours de repos
             back_to_back (bool): Si True, match dos à dos
-            
+                
         Returns:
             dict: Dictionnaire des prédictions par joueur
         """
         all_predictions = {}
         
-        # Obtenir la liste des joueurs de l'équipe
-        team_players = self.data[self.data['Team'] == team]['player_id'].unique()
+        # Obtenir la date actuelle (celle de la prédiction)
+        # Pour une simulation, on peut utiliser la date du dernier match dans les données
+        current_date = self.data['Date'].max()
+        
+        # Filtrer les joueurs actuellement dans l'équipe
+        # En prenant l'équipe la plus récente pour chaque joueur
+        player_current_teams = {}
+        
+        # Trouver l'équipe actuelle pour chaque joueur
+        for player_id in self.data['player_id'].unique():
+            player_games = self.data[self.data['player_id'] == player_id].sort_values('Date')
+            if len(player_games) > 0:
+                # Prendre l'équipe du dernier match joué
+                last_game = player_games.iloc[-1]
+                player_current_teams[player_id] = last_game['Team']
+        
+        # Filtrer seulement les joueurs qui sont actuellement dans l'équipe demandée
+        team_players = [pid for pid, current_team in player_current_teams.items() 
+                        if current_team == team]
+        
+        # S'il n'y a pas assez de joueurs trouvés (au moins 8), c'est peut-être un problème de données
+        if len(team_players) < 8:
+            print(f"Attention: Seulement {len(team_players)} joueurs trouvés pour {team}.")
         
         for player_id in team_players:
             # Vérifier si le joueur a suffisamment de données
@@ -544,8 +597,13 @@ class NBAStatsPredictor:
                 player_id, opponent, team, is_home, rest_days, back_to_back
             )
             
-            # Calculer le temps de jeu moyen récent
-            recent_mp = player_data['MP'].tail(10).mean()
+            # Calculer le temps de jeu moyen récent (des 5 derniers matchs avec l'équipe actuelle)
+            recent_player_data = player_data[player_data['Team'] == team].tail(5)
+            if len(recent_player_data) > 0:
+                recent_mp = recent_player_data['MP'].mean()
+            else:
+                # Si pas de données récentes avec cette équipe, utiliser les 3 derniers matchs peu importe l'équipe
+                recent_mp = player_data.tail(3)['MP'].mean()
             
             # Ne conserver que les joueurs avec un temps de jeu significatif
             if recent_mp >= 10:
@@ -556,6 +614,7 @@ class NBAStatsPredictor:
                 }
         
         return all_predictions
+        
         
     def compare_predictions_with_actual(self, player_id, last_n_games=5):
         """
@@ -579,9 +638,15 @@ class NBAStatsPredictor:
         results = []
         
         for i, (_, game) in enumerate(test_games.iterrows()):
-            # Récupérer les données jusqu'à ce match (exclu)
-            historical_data = player_data.iloc[:-last_n_games+i]
+            # IMPORTANT: Utiliser seulement les données disponibles jusqu'à ce point dans le temps
+            # Pour éviter la fuite de données temporelles
+            cutoff_date = game['Date']
+            historical_data = player_data[player_data['Date'] < cutoff_date].copy()
             
+            # S'assurer que nous avons suffisamment de données historiques
+            if len(historical_data) < 10:
+                continue
+                
             # Déterminer si c'est un match à domicile
             is_home = 1 if '@' not in str(game['Opp']) else 0
             
@@ -593,6 +658,12 @@ class NBAStatsPredictor:
             
             # Déterminer si c'est un back-to-back
             is_back_to_back = game['is_back_to_back'] if 'is_back_to_back' in game else False
+            
+            # Créer les caractéristiques pour les données historiques
+            historical_data_with_features = self._create_features_for_player(historical_data)
+            
+            # Calculer les forces des équipes avec les données historiques
+            self._calculate_team_strength(historical_data_with_features)
             
             # Prédire pour chaque statistique
             predictions = {}
@@ -615,38 +686,31 @@ class NBAStatsPredictor:
                     # Préparer les caractéristiques pour la prédiction
                     X_pred = {}
                     
+                    # Utiliser les dernières valeurs des données historiques
+                    last_row = historical_data_with_features.iloc[-1]
+                    
                     # Moyennes mobiles
-                    X_pred[f'{stat}_avg_3'] = historical_data[stat].tail(3).mean() if len(historical_data) >= 3 else historical_data[stat].mean()
-                    X_pred[f'{stat}_avg_5'] = historical_data[stat].tail(5).mean() if len(historical_data) >= 5 else historical_data[stat].mean()
-                    X_pred[f'{stat}_avg_10'] = historical_data[stat].tail(10).mean() if len(historical_data) >= 10 else historical_data[stat].mean()
+                    X_pred[f'{stat}_avg_3'] = last_row[f'{stat}_avg_3'] if f'{stat}_avg_3' in last_row else historical_data[stat].tail(3).mean()
+                    X_pred[f'{stat}_avg_5'] = last_row[f'{stat}_avg_5'] if f'{stat}_avg_5' in last_row else historical_data[stat].tail(5).mean()
+                    X_pred[f'{stat}_avg_10'] = last_row[f'{stat}_avg_10'] if f'{stat}_avg_10' in last_row else historical_data[stat].tail(10).mean()
                     
                     # Écart-type
-                    X_pred[f'{stat}_std_5'] = historical_data[stat].tail(5).std() if len(historical_data) >= 5 else 0
+                    X_pred[f'{stat}_std_5'] = last_row[f'{stat}_std_5'] if f'{stat}_std_5' in last_row else historical_data[stat].tail(5).std()
                     
                     # Tendance
-                    if len(historical_data) >= 5:
-                        last_5 = historical_data[stat].tail(5).values
-                        X_pred[f'{stat}_trend'] = (last_5[-1] - last_5[0]) / 4
-                    else:
-                        X_pred[f'{stat}_trend'] = 0
+                    X_pred[f'{stat}_trend'] = last_row[f'{stat}_trend'] if f'{stat}_trend' in last_row else 0
                     
                     # Moyenne pondérée
-                    if len(historical_data) >= 3:
-                        last_3 = historical_data[stat].tail(3).values
-                        weights = np.array([0.5, 0.3, 0.2])[:len(last_3)]
-                        weights = weights / weights.sum()
-                        X_pred[f'{stat}_weighted'] = np.sum(last_3[::-1] * weights)
-                    else:
-                        X_pred[f'{stat}_weighted'] = historical_data[stat].mean()
+                    X_pred[f'{stat}_weighted'] = last_row[f'{stat}_weighted'] if f'{stat}_weighted' in last_row else historical_data[stat].tail(3).mean()
                     
                     # Variables d'utilisation
-                    if 'usage_rate' in historical_data.columns:
-                        X_pred['usage_rate'] = historical_data['usage_rate'].tail(5).mean() if len(historical_data) >= 5 else 0.2
+                    if 'usage_rate' in historical_data_with_features.columns:
+                        X_pred['usage_rate'] = last_row['usage_rate']
                     else:
                         X_pred['usage_rate'] = 0.2
                         
-                    if 'pts_per_shot' in historical_data.columns:
-                        X_pred['pts_per_shot'] = historical_data['pts_per_shot'].tail(5).mean() if len(historical_data) >= 5 else 1.0
+                    if 'pts_per_shot' in historical_data_with_features.columns:
+                        X_pred['pts_per_shot'] = last_row['pts_per_shot']
                     else:
                         X_pred['pts_per_shot'] = 1.0
                     
@@ -654,7 +718,6 @@ class NBAStatsPredictor:
                     X_pred['rest_days'] = rest_days
                     X_pred['is_home'] = is_home
                     X_pred['is_back_to_back'] = 1 if is_back_to_back else 0
-                    X_pred['road_trip_game'] = 0  # Simplifié
                     X_pred['Team'] = game['Team']
                     X_pred['Opp'] = game['Opp']
                     
@@ -719,13 +782,14 @@ class NBAStatsPredictor:
     
     def generate_matchup_analysis(self, team, opponent, is_home=True):
         """
-        Génère une analyse détaillée d'un match entre deux équipes
+        Génère une analyse détaillée d'un match entre deux équipes avec des scores plus réalistes
+        et des minutes cohérentes
         
         Args:
             team (str): Équipe principale
             opponent (str): Équipe adverse
             is_home (bool): Si True, l'équipe principale joue à domicile
-            
+                
         Returns:
             dict: Analyse complète du match avec prédictions de tous les joueurs
         """
@@ -735,7 +799,55 @@ class NBAStatsPredictor:
         # Prédire les stats pour tous les joueurs de l'équipe adverse
         opp_predictions = self.predict_for_all_players(team, opponent, not is_home)
         
-        # Calculer les totaux d'équipe
+        # Normaliser les minutes pour qu'elles totalisent 240 minutes par équipe (5 joueurs × 48 minutes)
+        TOTAL_TEAM_MINUTES = 240
+        
+        # Normaliser les minutes pour l'équipe principale
+        total_team_minutes = sum(p['predictions']['MP'] for p in team_predictions.values())
+        if total_team_minutes > 0:  # Éviter la division par zéro
+            minutes_scale_factor = TOTAL_TEAM_MINUTES / total_team_minutes
+            
+            # Appliquer le facteur d'échelle aux minutes et ajuster les autres stats proportionnellement
+            for player_id, player_data in team_predictions.items():
+                original_minutes = player_data['predictions']['MP']
+                scaled_minutes = original_minutes * minutes_scale_factor
+                
+                # Limiter les minutes à 48 par joueur maximum (cas de joueurs avec trop de minutes)
+                if scaled_minutes > 48:
+                    scaled_minutes = 48
+                    
+                # Calculer le facteur d'ajustement pour les autres stats basé sur la modification des minutes
+                if original_minutes > 0:  # Éviter la division par zéro
+                    stat_scale_factor = scaled_minutes / original_minutes
+                    
+                    # Appliquer le facteur aux autres stats liées au temps de jeu
+                    for stat in ['PTS', 'TRB', 'AST', 'STL', 'BLK', '3P', 'TOV']:
+                        player_data['predictions'][stat] *= stat_scale_factor
+                    
+                    # Mettre à jour les minutes
+                    player_data['predictions']['MP'] = scaled_minutes
+        
+        # Faire de même pour l'équipe adverse
+        total_opp_minutes = sum(p['predictions']['MP'] for p in opp_predictions.values())
+        if total_opp_minutes > 0:
+            minutes_scale_factor = TOTAL_TEAM_MINUTES / total_opp_minutes
+            
+            for player_id, player_data in opp_predictions.items():
+                original_minutes = player_data['predictions']['MP']
+                scaled_minutes = original_minutes * minutes_scale_factor
+                
+                if scaled_minutes > 48:
+                    scaled_minutes = 48
+                    
+                if original_minutes > 0:
+                    stat_scale_factor = scaled_minutes / original_minutes
+                    
+                    for stat in ['PTS', 'TRB', 'AST', 'STL', 'BLK', '3P', 'TOV']:
+                        player_data['predictions'][stat] *= stat_scale_factor
+                    
+                    player_data['predictions']['MP'] = scaled_minutes
+        
+        # Calculer les totaux d'équipe ajustés
         team_totals = {
             'PTS': sum(p['predictions']['PTS'] for p in team_predictions.values()),
             'TRB': sum(p['predictions']['TRB'] for p in team_predictions.values()),
@@ -743,7 +855,8 @@ class NBAStatsPredictor:
             'STL': sum(p['predictions']['STL'] for p in team_predictions.values()),
             'BLK': sum(p['predictions']['BLK'] for p in team_predictions.values()),
             '3P': sum(p['predictions']['3P'] for p in team_predictions.values()),
-            'TOV': sum(p['predictions']['TOV'] for p in team_predictions.values())
+            'TOV': sum(p['predictions']['TOV'] for p in team_predictions.values()),
+            'MP': sum(p['predictions']['MP'] for p in team_predictions.values())
         }
         
         opp_totals = {
@@ -753,8 +866,53 @@ class NBAStatsPredictor:
             'STL': sum(p['predictions']['STL'] for p in opp_predictions.values()),
             'BLK': sum(p['predictions']['BLK'] for p in opp_predictions.values()),
             '3P': sum(p['predictions']['3P'] for p in opp_predictions.values()),
-            'TOV': sum(p['predictions']['TOV'] for p in opp_predictions.values())
+            'TOV': sum(p['predictions']['TOV'] for p in opp_predictions.values()),
+            'MP': sum(p['predictions']['MP'] for p in opp_predictions.values())
         }
+        
+        # Ajuster les scores pour qu'ils soient réalistes
+        # Les équipes NBA marquent généralement entre 85 et 135 points par match
+        MIN_SCORE = 85
+        MAX_SCORE = 135
+        
+        # Facteurs d'ajustement pour équilibrer les prédictions 
+        # (basé sur l'avantage du terrain et les forces relatives)
+        home_advantage = 3.5  # L'équipe à domicile marque en moyenne 3.5 points de plus
+        
+        # Calculer le facteur d'échelle pour ramener les scores dans une plage réaliste
+        team_score = team_totals['PTS']
+        opp_score = opp_totals['PTS']
+        
+        # Ajuster en fonction de l'avantage du terrain
+        if is_home:
+            team_score += home_advantage
+            opp_score -= home_advantage
+        else:
+            team_score -= home_advantage
+            opp_score += home_advantage
+        
+        # Normaliser les scores si nécessaire
+        if team_score < MIN_SCORE:
+            team_scale = MIN_SCORE / team_score
+            team_score = MIN_SCORE
+        elif team_score > MAX_SCORE:
+            team_scale = MAX_SCORE / team_score
+            team_score = MAX_SCORE
+        else:
+            team_scale = 1.0
+            
+        if opp_score < MIN_SCORE:
+            opp_scale = MIN_SCORE / opp_score
+            opp_score = MIN_SCORE
+        elif opp_score > MAX_SCORE:
+            opp_scale = MAX_SCORE / opp_score
+            opp_score = MAX_SCORE
+        else:
+            opp_scale = 1.0
+        
+        # Mettre à jour les points dans les totaux
+        team_totals['PTS'] = team_score
+        opp_totals['PTS'] = opp_score
         
         # Identifier les joueurs clés (top 3 scores prédits)
         team_key_players = sorted(
