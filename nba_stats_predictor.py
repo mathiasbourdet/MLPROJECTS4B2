@@ -55,7 +55,11 @@ class NBAStatsPredictor:
             self.data = self.data.sort_values(['player_id', 'Date'])
             
             # Ajouter indicateur domicile/extérieur
-            self.data['is_home'] = ~self.data['Opp'].str.contains('@', na=False).astype(int)
+            self.data['is_home'] = self.data['Result'].apply(
+            lambda x: 0 if isinstance(x, str) and x.split(',')[0] == 'W' and 
+                         int(x.split(' ')[1].split('-')[0]) > int(x.split(' ')[1].split('-')[1])
+                       else 1  # Par défaut, considérer comme à domicile
+        )
             
             # Ajouter jours de repos - ATTENTION: ne pas utiliser diff() directement car peut causer des fuites
             self.data['rest_days'] = self.data.groupby('player_id')['Date'].diff().dt.days.fillna(3)
@@ -271,7 +275,7 @@ class NBAStatsPredictor:
                     # Utiliser GradientBoostingRegressor pour plus de précision
                     pipeline = Pipeline(steps=[
                         ('preprocessor', preprocessor),
-                        ('regressor', GradientBoostingRegressor(
+                        ('regressor', RandomForestRegressor(
                             n_estimators=150, 
                             learning_rate=0.05,
                             max_depth=4,
@@ -937,6 +941,141 @@ class NBAStatsPredictor:
             "opponent_key_players": opp_key_players,
             "predicted_winner": team if team_totals['PTS'] > opp_totals['PTS'] else opponent,
             "predicted_score": f"{round(team_totals['PTS'])}-{round(opp_totals['PTS'])}"
+        }
+    def compare_models(self, player_id):
+        """
+        Compare différents modèles de machine learning pour un joueur donné
+        
+        Args:
+            player_id (str): ID du joueur
+            
+        Returns:
+            dict: Résultats de performance des différents modèles
+        """
+        from sklearn.ensemble import RandomForestRegressor
+        from sklearn.svm import SVR
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.metrics import r2_score, mean_absolute_error
+        
+        # Récupérer les données du joueur
+        player_data = self.data[self.data['player_id'] == player_id].copy()
+        
+        if len(player_data) < 20:  # Minimum de données pour une évaluation fiable
+            return {"error": f"Pas assez de données pour {player_id}"}
+        
+        # Trier par date (crucial pour éviter la fuite de données)
+        player_data = player_data.sort_values('Date')
+        
+        # Définir les indices de séparation (80% entraînement, 20% test)
+        train_size = int(len(player_data) * 0.8)
+        train_data = player_data.iloc[:train_size]
+        test_data = player_data.iloc[train_size:]
+        
+        # Sélectionner une statistique pour l'évaluation (par exemple, points)
+        target_stat = 'PTS'
+        
+        # Préparer les features (caractéristiques simplifiées pour cette démonstration)
+        train_data_with_features = self._create_features_for_player(train_data)
+        
+        # Créer une version de test avec les caractéristiques
+        test_start_date = test_data['Date'].min()
+        historical_data_for_test = player_data[player_data['Date'] < test_start_date].copy()
+        combined_data = pd.concat([historical_data_for_test, test_data]).sort_values('Date')
+        combined_data_with_features = self._create_features_for_player(combined_data)
+        test_data_with_features = combined_data_with_features[
+            combined_data_with_features['Date'] >= test_start_date
+        ].copy()
+        
+        # Définir les caractéristiques communes pour tous les modèles
+        base_features = [
+            f'{target_stat}_avg_3', f'{target_stat}_avg_5', f'{target_stat}_avg_10',
+            f'{target_stat}_std_5', f'{target_stat}_trend', f'{target_stat}_weighted',
+            'is_home', 'is_back_to_back', 'rest_days'
+        ]
+        
+        # Vérifier quelles caractéristiques sont disponibles
+        available_features = [f for f in base_features if f in train_data_with_features.columns]
+        
+        if len(available_features) < 3:  # Pas assez de caractéristiques
+            return {"error": "Caractéristiques insuffisantes pour une comparaison de modèles"}
+        
+        # Préparer les données
+        X_train = train_data_with_features[available_features].dropna()
+        y_train = train_data_with_features.loc[X_train.index, target_stat]
+        
+        X_test = test_data_with_features[available_features].dropna()
+        y_test = test_data_with_features.loc[X_test.index, target_stat]
+        
+        if len(X_train) < 10 or len(X_test) < 5:
+            return {"error": "Données insuffisantes après traitement"}
+        
+        # Normaliser les données pour SVR
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        X_test_scaled = scaler.transform(X_test)
+        
+        # Définir les modèles à comparer
+        models = {
+            "GradientBoosting": {
+                "model": GradientBoostingRegressor(
+                    n_estimators=150, 
+                    learning_rate=0.05,
+                    max_depth=4,
+                    random_state=42
+                ),
+                "needs_scaling": False
+            },
+            "RandomForest": {
+                "model": RandomForestRegressor(
+                    n_estimators=200,
+                    max_depth=10,
+                    min_samples_split=5,
+                    min_samples_leaf=2,
+                    random_state=42
+                ),
+                "needs_scaling": False
+            },
+            "SVR": {
+                "model": SVR(
+                    kernel='rbf',
+                    C=10.0,
+                    epsilon=0.2,
+                    gamma='scale'
+                ),
+                "needs_scaling": True
+            }
+        }
+        
+        # Entraîner et évaluer chaque modèle
+        results = {}
+        for name, model_info in models.items():
+            model = model_info["model"]
+            
+            # Utiliser les données normalisées pour SVR
+            if model_info["needs_scaling"]:
+                model.fit(X_train_scaled, y_train)
+                y_pred = model.predict(X_test_scaled)
+            else:
+                model.fit(X_train, y_train)
+                y_pred = model.predict(X_test)
+            
+            # Calculer les métriques
+            r2 = r2_score(y_test, y_pred)
+            mae = mean_absolute_error(y_test, y_pred)
+            
+            results[name] = {
+                "R²": r2,
+                "MAE": mae,
+                "predictions": y_pred.tolist(),
+                "actual": y_test.tolist()
+            }
+        
+        return {
+            "player_id": player_id,
+            "model_results": results,
+            "test_size": len(y_test),
+            "feature_count": len(available_features),
+            "features_used": available_features
         }
 
 def main():
