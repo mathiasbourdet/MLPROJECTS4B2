@@ -1,4 +1,3 @@
-
 NBA Player Game Logs Dataset
 Description
 Ce projet consiste en la création d'un dataset contenant les statistiques de matchs (game logs) des principaux joueurs de la NBA pour la saison 2024-2025. Les données sont obtenues par web scraping du site Basketball Reference.
@@ -30,9 +29,109 @@ Nettoyage et normalisation des données (conversion des minutes, gestion des col
 
 Comment Utiliser
 
-Installer les dépendances requises :
+# Guide d'Installation des Dépendances avec UV
 
-pip install requests pandas
+## Qu'est-ce que UV?
+
+UV est un installateur de paquets Python ultra-rapide, écrit en Rust, qui peut remplacer pip. Il est significativement plus rapide que pip et offre une meilleure gestion des dépendances.
+
+## Installation de UV
+
+### Sur macOS
+```bash
+brew install uv
+```
+
+### Sur Linux/WSL
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+### Sur Windows
+```bash
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+## Création d'un Environnement Virtuel avec UV
+
+1. Créez un nouvel environnement virtuel :
+```bash
+python -m venv .venv
+```
+
+2. Activez l'environnement virtuel :
+
+   - Sur macOS/Linux :
+   ```bash
+   source .venv/bin/activate
+   ```
+   
+   - Sur Windows :
+   ```bash
+   .venv\Scripts\activate
+   ```
+
+## Installation des Dépendances
+
+Une fois l'environnement virtuel activé, installez les dépendances avec UV :
+
+```bash
+uv pip install -r requirements.txt
+```
+
+### Avantages d'utiliser UV
+
+- 10-100x plus rapide que pip
+- Cache intelligent des paquets
+- Résolution déterministe des dépendances
+- Compatible avec pip et les requirements.txt standards
+
+### Commandes UV Utiles
+
+- Installer un paquet spécifique :
+```bash
+uv pip install numpy
+```
+
+- Mettre à jour un paquet :
+```bash
+uv pip install --upgrade pandas
+```
+
+- Voir les paquets installés :
+```bash
+uv pip freeze
+```
+
+## Dépendances du Projet
+
+Ce projet utilise les bibliothèques Python suivantes :
+
+- numpy (≥1.24.0) : Calculs numériques
+- pandas (≥2.0.0) : Manipulation de données
+- scikit-learn (≥1.2.0) : Machine learning
+- matplotlib (≥3.7.0) : Visualisation de données
+- seaborn (≥0.12.0) : Visualisation statistique
+- jupyter (≥1.0.0) : Notebooks Jupyter
+- python-dotenv (≥1.0.0) : Gestion des variables d'environnement
+
+## Résolution des Problèmes Courants
+
+1. Si UV n'est pas reconnu comme une commande :
+   - Vérifiez que UV est bien installé : `which uv`
+   - Redémarrez votre terminal
+   - Assurez-vous que le chemin de UV est dans votre PATH
+
+2. En cas d'erreur de dépendances :
+   ```bash
+   uv pip install --upgrade -r requirements.txt
+   ```
+
+3. Pour nettoyer le cache de UV :
+   ```bash
+   uv cache clean
+   ```
+
 
 Exécuter le script :
 
