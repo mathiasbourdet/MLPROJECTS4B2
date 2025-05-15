@@ -942,219 +942,219 @@ class NBAStatsPredictor:
             "predicted_winner": team if team_totals['PTS'] > opp_totals['PTS'] else opponent,
             "predicted_score": f"{round(team_totals['PTS'])}-{round(opp_totals['PTS'])}"
         }
-def compare_models(self, player_id):
-    """
-    Compare différents modèles de machine learning pour un joueur donné
-    et évalue les performances sur chaque statistique
-    
-    Args:
-        player_id (str): ID du joueur
+    def compare_models(self, player_id):
+        """
+        Compare différents modèles de machine learning pour un joueur donné
+        et évalue les performances sur chaque statistique
         
-    Returns:
-        dict: Résultats de performance des différents modèles
-    """
-    from sklearn.ensemble import RandomForestRegressor
-    from sklearn.svm import SVR
-    from sklearn.linear_model import LinearRegression
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.metrics import r2_score, mean_absolute_error
-    import numpy as np
-    
-    # Récupérer les données du joueur
-    player_data = self.data[self.data['player_id'] == player_id].copy()
-    
-    if len(player_data) < 20:  # Minimum de données pour une évaluation fiable
-        return {"error": f"Pas assez de données pour {player_id}"}
-    
-    # Trier par date (crucial pour éviter la fuite de données)
-    player_data = player_data.sort_values('Date')
-    
-    # Définir les indices de séparation (80% entraînement, 20% test)
-    train_size = int(len(player_data) * 0.8)
-    train_data = player_data.iloc[:train_size]
-    test_data = player_data.iloc[train_size:]
-    
-    # Les modèles à comparer
-    models = {
-        "GradientBoosting": {
-            "type": GradientBoostingRegressor(
-                n_estimators=150,
-                learning_rate=0.05,
-                max_depth=4,
-                random_state=42
-            ),
-            "needs_scaling": False,
-            "is_baseline": False
-        },
-        "RandomForest": {
-            "type": RandomForestRegressor(
-                n_estimators=200,
-                max_depth=10,
-                min_samples_split=5,
-                min_samples_leaf=2,
-                random_state=42
-            ),
-            "needs_scaling": False,
-            "is_baseline": False
-        },
-        "SVR": {
-            "type": SVR(
-                kernel='rbf',
-                C=10.0,
-                epsilon=0.2,
-                gamma='scale'
-            ),
-            "needs_scaling": True,
-            "is_baseline": False
-        },
-        "LinearRegression": {
-            "type": LinearRegression(),
-            "needs_scaling": True,
-            "is_baseline": True
-        },
-        "MovingAverage5": {
-            "type": "custom_baseline",
-            "needs_scaling": False,
-            "is_baseline": True
-        },
-        "SeasonAverage": {
-            "type": "custom_baseline",
-            "needs_scaling": False,
-            "is_baseline": True
-        }
-    }
-    
-    # Résultats pour chaque modèle
-    results = {}
-    stat_performances = {}
-    feature_importance = {}
-    
-    # Évaluer sur plusieurs statistiques, pas seulement points
-    target_stats = ['PTS', 'TRB', 'AST', 'STL', 'BLK', '3P', 'MP', 'TOV']
-    
-    # Pour stocker les performances par statistique
-    for model_name in models:
-        stat_performances[model_name] = {}
-        for stat in target_stats:
-            stat_performances[model_name][stat] = {"R²": None, "MAE": None}
-    
-    # Statistique principale pour la comparaison générale des modèles
-    main_stat = 'PTS'
-    
-    # Pour chaque statistique
-    for target_stat in target_stats:
-        # Préparer les features
-        train_data_with_features = self._create_features_for_player(train_data)
-        
-        # Créer une version de test avec les caractéristiques
-        test_start_date = test_data['Date'].min()
-        historical_data_for_test = player_data[player_data['Date'] < test_start_date].copy()
-        combined_data = pd.concat([historical_data_for_test, test_data]).sort_values('Date')
-        combined_data_with_features = self._create_features_for_player(combined_data)
-        test_data_with_features = combined_data_with_features[
-            combined_data_with_features['Date'] >= test_start_date
-        ].copy()
-        
-        # Définir les caractéristiques communes pour tous les modèles
-        base_features = [
-            f'{target_stat}_avg_3', f'{target_stat}_avg_5', f'{target_stat}_avg_10',
-            f'{target_stat}_std_5', f'{target_stat}_trend', f'{target_stat}_weighted',
-            'is_home', 'is_back_to_back', 'rest_days'
-        ]
-        
-        # Vérifier quelles caractéristiques sont disponibles
-        available_features = [f for f in base_features if f in train_data_with_features.columns]
-        
-        if len(available_features) < 3:  # Pas assez de caractéristiques
-            continue
-        
-        # Préparer les données
-        X_train = train_data_with_features[available_features].dropna()
-        y_train = train_data_with_features.loc[X_train.index, target_stat]
-        
-        X_test = test_data_with_features[available_features].dropna()
-        y_test = test_data_with_features.loc[X_test.index, target_stat]
-        
-        if len(X_train) < 10 or len(X_test) < 5:
-            continue
-        
-        # Normaliser les données 
-        scaler = StandardScaler()
-        X_train_scaled = scaler.fit_transform(X_train)
-        X_test_scaled = scaler.transform(X_test)
-        
-        # Déterminer la moyenne de saison pour la baseline
-        season_avg = y_train.mean()
-        
-        # Évaluer chaque modèle pour cette statistique
-        for name, model_info in models.items():
-            if model_info["type"] == "custom_baseline":
-                # Gérer les baselines personnalisées
-                if name == "MovingAverage5":
-                    # Prédire avec moyenne mobile des 5 derniers matchs
-                    y_pred = []
-                    for idx in range(len(y_test)):
-                        test_date = test_data_with_features.iloc[idx]['Date']
-                        prev_matches = train_data_with_features[train_data_with_features['Date'] < test_date]
-                        if len(prev_matches) >= 5:
-                            y_pred.append(prev_matches[target_stat].tail(5).mean())
-                        else:
-                            y_pred.append(prev_matches[target_stat].mean() if len(prev_matches) > 0 else season_avg)
-                        
-                elif name == "SeasonAverage":
-                    # Prédire avec la moyenne de saison
-                    y_pred = [season_avg] * len(y_test)
-            else:
-                # Créer une copie du modèle
-                model = model_info["type"]
-                
-                # Entraîner et prédire
-                if model_info["needs_scaling"]:
-                    model.fit(X_train_scaled, y_train)
-                    y_pred = model.predict(X_test_scaled)
-                else:
-                    model.fit(X_train, y_train)
-                    y_pred = model.predict(X_test)
-                    
-                    # Récupérer l'importance des caractéristiques pour les modèles qui le supportent
-                    if target_stat == main_stat and hasattr(model, 'feature_importances_'):
-                        # Pour GradientBoosting et RandomForest
-                        feat_importance = dict(zip(available_features, model.feature_importances_))
-                        # Normaliser pour avoir une somme de 1
-                        total = sum(feat_importance.values())
-                        if total > 0:
-                            feat_importance = {k: v/total for k, v in feat_importance.items()}
-                            feature_importance[name] = feat_importance
+        Args:
+            player_id (str): ID du joueur
             
-            # Calculer les métriques
-            r2 = r2_score(y_test, y_pred)
-            mae = mean_absolute_error(y_test, y_pred)
-            
-            # Enregistrer les performances pour cette statistique
-            stat_performances[name][target_stat] = {
-                "R²": r2,
-                "MAE": mae
+        Returns:
+            dict: Résultats de performance des différents modèles
+        """
+        from sklearn.ensemble import RandomForestRegressor
+        from sklearn.svm import SVR
+        from sklearn.linear_model import LinearRegression
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.metrics import r2_score, mean_absolute_error
+        import numpy as np
+        
+        # Récupérer les données du joueur
+        player_data = self.data[self.data['player_id'] == player_id].copy()
+        
+        if len(player_data) < 20:  # Minimum de données pour une évaluation fiable
+            return {"error": f"Pas assez de données pour {player_id}"}
+        
+        # Trier par date (crucial pour éviter la fuite de données)
+        player_data = player_data.sort_values('Date')
+        
+        # Définir les indices de séparation (80% entraînement, 20% test)
+        train_size = int(len(player_data) * 0.8)
+        train_data = player_data.iloc[:train_size]
+        test_data = player_data.iloc[train_size:]
+        
+        # Les modèles à comparer
+        models = {
+            "GradientBoosting": {
+                "type": GradientBoostingRegressor(
+                    n_estimators=150,
+                    learning_rate=0.05,
+                    max_depth=4,
+                    random_state=42
+                ),
+                "needs_scaling": False,
+                "is_baseline": False
+            },
+            "RandomForest": {
+                "type": RandomForestRegressor(
+                    n_estimators=200,
+                    max_depth=10,
+                    min_samples_split=5,
+                    min_samples_leaf=2,
+                    random_state=42
+                ),
+                "needs_scaling": False,
+                "is_baseline": False
+            },
+            "SVR": {
+                "type": SVR(
+                    kernel='rbf',
+                    C=10.0,
+                    epsilon=0.2,
+                    gamma='scale'
+                ),
+                "needs_scaling": True,
+                "is_baseline": False
+            },
+            "LinearRegression": {
+                "type": LinearRegression(),
+                "needs_scaling": True,
+                "is_baseline": True
+            },
+            "MovingAverage5": {
+                "type": "custom_baseline",
+                "needs_scaling": False,
+                "is_baseline": True
+            },
+            "SeasonAverage": {
+                "type": "custom_baseline",
+                "needs_scaling": False,
+                "is_baseline": True
             }
+        }
+        
+        # Résultats pour chaque modèle
+        results = {}
+        stat_performances = {}
+        feature_importance = {}
+        
+        # Évaluer sur plusieurs statistiques, pas seulement points
+        target_stats = ['PTS', 'TRB', 'AST', 'STL', 'BLK', '3P', 'MP', 'TOV']
+        
+        # Pour stocker les performances par statistique
+        for model_name in models:
+            stat_performances[model_name] = {}
+            for stat in target_stats:
+                stat_performances[model_name][stat] = {"R²": None, "MAE": None}
+        
+        # Statistique principale pour la comparaison générale des modèles
+        main_stat = 'PTS'
+        
+        # Pour chaque statistique
+        for target_stat in target_stats:
+            # Préparer les features
+            train_data_with_features = self._create_features_for_player(train_data)
             
-            # Pour la statistique principale, enregistrer les résultats complets
-            if target_stat == main_stat:
-                results[name] = {
+            # Créer une version de test avec les caractéristiques
+            test_start_date = test_data['Date'].min()
+            historical_data_for_test = player_data[player_data['Date'] < test_start_date].copy()
+            combined_data = pd.concat([historical_data_for_test, test_data]).sort_values('Date')
+            combined_data_with_features = self._create_features_for_player(combined_data)
+            test_data_with_features = combined_data_with_features[
+                combined_data_with_features['Date'] >= test_start_date
+            ].copy()
+            
+            # Définir les caractéristiques communes pour tous les modèles
+            base_features = [
+                f'{target_stat}_avg_3', f'{target_stat}_avg_5', f'{target_stat}_avg_10',
+                f'{target_stat}_std_5', f'{target_stat}_trend', f'{target_stat}_weighted',
+                'is_home', 'is_back_to_back', 'rest_days'
+            ]
+            
+            # Vérifier quelles caractéristiques sont disponibles
+            available_features = [f for f in base_features if f in train_data_with_features.columns]
+            
+            if len(available_features) < 3:  # Pas assez de caractéristiques
+                continue
+            
+            # Préparer les données
+            X_train = train_data_with_features[available_features].dropna()
+            y_train = train_data_with_features.loc[X_train.index, target_stat]
+            
+            X_test = test_data_with_features[available_features].dropna()
+            y_test = test_data_with_features.loc[X_test.index, target_stat]
+            
+            if len(X_train) < 10 or len(X_test) < 5:
+                continue
+            
+            # Normaliser les données 
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(X_train)
+            X_test_scaled = scaler.transform(X_test)
+            
+            # Déterminer la moyenne de saison pour la baseline
+            season_avg = y_train.mean()
+            
+            # Évaluer chaque modèle pour cette statistique
+            for name, model_info in models.items():
+                if model_info["type"] == "custom_baseline":
+                    # Gérer les baselines personnalisées
+                    if name == "MovingAverage5":
+                        # Prédire avec moyenne mobile des 5 derniers matchs
+                        y_pred = []
+                        for idx in range(len(y_test)):
+                            test_date = test_data_with_features.iloc[idx]['Date']
+                            prev_matches = train_data_with_features[train_data_with_features['Date'] < test_date]
+                            if len(prev_matches) >= 5:
+                                y_pred.append(prev_matches[target_stat].tail(5).mean())
+                            else:
+                                y_pred.append(prev_matches[target_stat].mean() if len(prev_matches) > 0 else season_avg)
+                            
+                    elif name == "SeasonAverage":
+                        # Prédire avec la moyenne de saison
+                        y_pred = [season_avg] * len(y_test)
+                else:
+                    # Créer une copie du modèle
+                    model = model_info["type"]
+                    
+                    # Entraîner et prédire
+                    if model_info["needs_scaling"]:
+                        model.fit(X_train_scaled, y_train)
+                        y_pred = model.predict(X_test_scaled)
+                    else:
+                        model.fit(X_train, y_train)
+                        y_pred = model.predict(X_test)
+                        
+                        # Récupérer l'importance des caractéristiques pour les modèles qui le supportent
+                        if target_stat == main_stat and hasattr(model, 'feature_importances_'):
+                            # Pour GradientBoosting et RandomForest
+                            feat_importance = dict(zip(available_features, model.feature_importances_))
+                            # Normaliser pour avoir une somme de 1
+                            total = sum(feat_importance.values())
+                            if total > 0:
+                                feat_importance = {k: v/total for k, v in feat_importance.items()}
+                                feature_importance[name] = feat_importance
+                
+                # Calculer les métriques
+                r2 = r2_score(y_test, y_pred)
+                mae = mean_absolute_error(y_test, y_pred)
+                
+                # Enregistrer les performances pour cette statistique
+                stat_performances[name][target_stat] = {
                     "R²": r2,
-                    "MAE": mae,
-                    "is_baseline": model_info["is_baseline"],
-                    "predictions": y_pred if isinstance(y_pred, list) else y_pred.tolist(),
-                    "actual": y_test.tolist()
+                    "MAE": mae
                 }
-    
-    return {
-        "player_id": player_id,
-        "model_results": results,
-        "stat_performances": stat_performances,
-        "feature_importance": feature_importance,
-        "test_size": len(y_test) if 'y_test' in locals() else 0,
-        "features_used": available_features if 'available_features' in locals() else [],
-        "primary_metric": "R²"
-    }
+                
+                # Pour la statistique principale, enregistrer les résultats complets
+                if target_stat == main_stat:
+                    results[name] = {
+                        "R²": r2,
+                        "MAE": mae,
+                        "is_baseline": model_info["is_baseline"],
+                        "predictions": y_pred if isinstance(y_pred, list) else y_pred.tolist(),
+                        "actual": y_test.tolist()
+                    }
+        
+        return {
+            "player_id": player_id,
+            "model_results": results,
+            "stat_performances": stat_performances,
+            "feature_importance": feature_importance,
+            "test_size": len(y_test) if 'y_test' in locals() else 0,
+            "features_used": available_features if 'available_features' in locals() else [],
+            "primary_metric": "R²"
+        }
 
 def main():
     """
