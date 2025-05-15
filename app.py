@@ -891,7 +891,6 @@ elif selected == "🤖 Comparaison des Modèles":
         "Modèle": advanced_models,
         "R²": [round(model_results[m]["R²"], 2) for m in advanced_models],
         "MAE (Points)": [round(model_results[m]["MAE"], 2) for m in advanced_models],
-        "RMSE (Points)": [round(model_results[m]["RMSE"], 2) for m in advanced_models]
     }
     advanced_df = pd.DataFrame(advanced_comparison)
     advanced_df = advanced_df.sort_values("R²", ascending=False)  # Trier par R² décroissant
@@ -903,7 +902,7 @@ elif selected == "🤖 Comparaison des Modèles":
         "Modèle": baseline_models,
         "R²": [round(model_results[m]["R²"], 2) for m in baseline_models],
         "MAE (Points)": [round(model_results[m]["MAE"], 2) for m in baseline_models],
-        "RMSE (Points)": [round(model_results[m]["RMSE"], 2) for m in baseline_models]
+        
     }
     baseline_df = pd.DataFrame(baseline_comparison)
     baseline_df = baseline_df.sort_values("R²", ascending=False)  # Trier par R² décroissant
